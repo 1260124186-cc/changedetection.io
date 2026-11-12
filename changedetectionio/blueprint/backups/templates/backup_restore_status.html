@@ -1,0 +1,101 @@
+{% extends 'base.html' %}
+{% block content %}
+    {% if not journal or journal.status == 'running' %}
+        <meta http-equiv="refresh" content="2">
+    {% endif %}
+
+    {% macro action_label(action_taken) %}
+        {% if action_taken == 'added' %}{{ _('Added') }}
+        {% elif action_taken == 'updated' %}{{ _('Updated') }}
+        {% elif action_taken == 'already_synced' %}{{ _('Already in sync') }}
+        {% elif action_taken == 'skipped' %}{{ _('Skipped') }}
+        {% elif action_taken == 'failed' %}{{ _('Failed') }}
+        {% else %}{{ action_taken }}{% endif %}
+    {% endmacro %}
+
+    <div class="edit-form">
+        <div class="tabs collapsable">
+            <ul>
+                <li class="tab"><a href="{{ url_for('backups.create') }}">{{ _('Create') }}</a></li>
+                <li class="tab"><a href="{{ url_for('backups.restore.restore') }}">{{ _('Restore') }}</a></li>
+                <li class="tab active"><a href="{{ url_for('backups.selective_restore.selective_upload') }}">{{ _('Selective restore') }}</a></li>
+            </ul>
+        </div>
+        <div class="box-wrap inner">
+            <div id="general">
+                {% if not journal or journal.status == 'running' %}
+                    <p>
+                        <span class="spinner"></span>&nbsp;<strong>{{ _('Restore is running, this page refreshes automatically…') }}</strong>
+                    </p>
+                {% elif journal.status == 'failed' %}
+                    <p><strong class="error">{{ _('Restore finished with an error: %(error)s', error=journal.error) }}</strong></p>
+                {% else %}
+                    <p><strong>{{ _('Restore complete.') }}</strong></p>
+                {% endif %}
+
+                {% if journal %}
+                    {% if summary %}
+                        <p>
+                            {{ _('Added: %(added)s, Updated: %(updated)s, Already in sync: %(synced)s, Skipped: %(skipped)s, Failed: %(failed)s',
+                                 added=summary.added, updated=summary.updated, synced=summary.already_synced,
+                                 skipped=summary.skipped, failed=summary.failed) }}
+                        </p>
+                    {% endif %}
+
+                    {% if journal.results %}
+                        <table class="pure-table pure-table-striped" style="width: 100%;">
+                            <thead>
+                                <tr>
+                                    <th>{{ _('Type') }}</th>
+                                    <th>UUID</th>
+                                    <th>{{ _('Result') }}</th>
+                                    <th>{{ _('Reason / details') }}</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for result in journal.results %}
+                                    <tr>
+                                        <td>{{ _('Watch') if result.entity_type == 'watch' else _('Group') }}</td>
+                                        <td><code>{{ result.uuid }}</code></td>
+                                        <td>{{ action_label(result.action_taken) }}</td>
+                                        <td>
+                                            {% if result.reason == 'local_modified' %}
+                                                {{ _('Manually modified locally') }}
+                                                {% if result.details.changed_fields %}
+                                                    ({{ result.details.changed_fields|join(', ') }})
+                                                {% endif %}
+                                            {% elif result.reason == 'url_conflict' %}
+                                                {{ _('Same URL exists under UUID %(uuid)s', uuid=result.details.conflict_uuid) }}
+                                            {% elif result.reason == 'title_conflict' %}
+                                                {{ _('Same title exists under UUID %(uuid)s', uuid=result.details.conflict_uuid) }}
+                                            {% elif result.details.error %}
+                                                {{ result.details.error }}
+                                            {% endif %}
+                                        </td>
+                                    </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    {% endif %}
+
+                    {% if journal.dropped_tag_refs %}
+                        <h4>{{ _('Dropped group references (group not available locally)') }}</h4>
+                        <ul>
+                            {% for item in journal.dropped_tag_refs %}
+                                <li>
+                                    <code>{{ item.watch_uuid }}</code>: {{ item.tag_uuids|join(', ') }}
+                                </li>
+                            {% endfor %}
+                        </ul>
+                    {% endif %}
+                {% endif %}
+
+                <div class="pure-controls" style="margin-top: 1em;">
+                    <a class="pure-button" href="{{ url_for('backups.selective_restore.selective_upload') }}">
+                        {{ _('Back to selective restore') }}
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+{% endblock %}

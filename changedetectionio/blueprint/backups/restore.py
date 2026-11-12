@@ -26,6 +26,31 @@ _UUID_RE = re.compile(
 )
 
 
+def safe_extract_zip(zip_stream, dest_dir):
+    """Extract a backup zip stream into dest_dir with the shared safety guards.
+
+    - Rejects archives whose total uncompressed size exceeds _MAX_DECOMPRESSED_BYTES (zip-bomb guard,
+      checked against central-directory metadata without decompressing).
+    - Rejects any entry that would resolve outside dest_dir (Zip Slip guard, symlinks included via realpath).
+
+    Raises zipfile.BadZipFile for invalid archives and ValueError for unsafe/oversized ones.
+    Shared by the bulk restore flow and the selective restore flow.
+    """
+    with zipfile.ZipFile(zip_stream, 'r') as zf:
+        total_uncompressed = sum(m.file_size for m in zf.infolist())
+        if total_uncompressed > _MAX_DECOMPRESSED_BYTES:
+            raise ValueError(
+                f"Backup archive decompressed size ({total_uncompressed // (1024 * 1024)} MB) "
+                f"exceeds the {_MAX_DECOMPRESSED_BYTES // (1024 * 1024)} MB limit"
+            )
+        resolved_dest = os.path.realpath(dest_dir)
+        for member in zf.infolist():
+            member_dest = os.path.realpath(os.path.join(resolved_dest, member.filename))
+            if not member_dest.startswith(resolved_dest + os.sep) and member_dest != resolved_dest:
+                raise ValueError(f"Zip Slip path traversal detected in backup archive: {member.filename!r}")
+            zf.extract(member, dest_dir)
+
+
 class RestoreForm(Form):
     zip_file = MultipleFileField(_l('Backup .ZIP file(s)'), validators=[
         FileAllowed(['zip'], _l('Must be a .zip backup file!'))
@@ -60,19 +85,7 @@ def import_from_zip(zip_stream, datastore, include_groups, include_groups_replac
 
     with tempfile.TemporaryDirectory() as tmpdir:
         logger.debug(f"Restore: extracting zip to {tmpdir}")
-        with zipfile.ZipFile(zip_stream, 'r') as zf:
-            total_uncompressed = sum(m.file_size for m in zf.infolist())
-            if total_uncompressed > _MAX_DECOMPRESSED_BYTES:
-                raise ValueError(
-                    f"Backup archive decompressed size ({total_uncompressed // (1024 * 1024)} MB) "
-                    f"exceeds the {_MAX_DECOMPRESSED_BYTES // (1024 * 1024)} MB limit"
-                )
-            resolved_dest = os.path.realpath(tmpdir)
-            for member in zf.infolist():
-                member_dest = os.path.realpath(os.path.join(resolved_dest, member.filename))
-                if not member_dest.startswith(resolved_dest + os.sep) and member_dest != resolved_dest:
-                    raise ValueError(f"Zip Slip path traversal detected in backup archive: {member.filename!r}")
-                zf.extract(member, tmpdir)
+        safe_extract_zip(zip_stream, tmpdir)
         logger.debug("Restore: zip extracted, scanning UUID directories")
 
         for entry in os.scandir(tmpdir):
@@ -170,6 +183,15 @@ def import_from_zip(zip_stream, datastore, include_groups, include_groups_replac
     }
 
 
+# Module-level registry of bulk restore threads so the selective restore flow can
+# enforce that only one restore (of either kind) runs at a time.
+bulk_restore_threads = []
+
+
+def bulk_restore_running():
+    return any(t.is_alive() for t in bulk_restore_threads)
+
+
 def import_from_zips(zip_streams, **kwargs):
     """
     Import several backup zips one after another, in upload order (a later zip wins for a shared UUID
@@ -187,7 +209,6 @@ def import_from_zips(zip_streams, **kwargs):
 
 def construct_restore_blueprint(datastore):
     restore_blueprint = Blueprint('restore', __name__, template_folder="templates")
-    restore_threads = []
 
     @restore_blueprint.route("/restore", methods=['GET'])
     @login_optionally_required
@@ -195,14 +216,17 @@ def construct_restore_blueprint(datastore):
         form = RestoreForm()
         return render_template("backup_restore.html",
                                form=form,
-                               restore_running=any(t.is_alive() for t in restore_threads),
+                               restore_running=bulk_restore_running(),
                                max_upload_mb=_MAX_UPLOAD_BYTES // (1024 * 1024),
                                max_decompressed_mb=_MAX_DECOMPRESSED_BYTES // (1024 * 1024))
 
     @restore_blueprint.route("/restore/start", methods=['POST'])
     @login_optionally_required
     def backups_restore_start():
-        if any(t.is_alive() for t in restore_threads):
+        # Local import avoids a circular import (selective.restore imports this module).
+        from .selective import selective_restore_running
+
+        if bulk_restore_running() or selective_restore_running():
             flash(gettext("A restore is already running, check back in a few minutes"), "error")
             return redirect(url_for('backups.restore.restore'))
 
@@ -261,8 +285,8 @@ def construct_restore_blueprint(datastore):
             name="BackupRestore"
         )
         restore_thread.start()
-        restore_threads[:] = [t for t in restore_threads if t.is_alive()]
-        restore_threads.append(restore_thread)
+        bulk_restore_threads[:] = [t for t in bulk_restore_threads if t.is_alive()]
+        bulk_restore_threads.append(restore_thread)
         flash(gettext("Restore started in background, check back in a few minutes."))
         return redirect(url_for('backups.restore.restore'))
 

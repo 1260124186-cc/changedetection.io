@@ -1,0 +1,43 @@
+{% extends 'base.html' %}
+{% block content %}
+    <div class="edit-form">
+        <div class="tabs collapsable">
+            <ul>
+                <li class="tab"><a href="{{ url_for('backups.create') }}">{{ _('Create') }}</a></li>
+                <li class="tab"><a href="{{ url_for('backups.restore.restore') }}">{{ _('Restore') }}</a></li>
+                <li class="tab active"><a href="{{ url_for('backups.selective_restore.selective_upload') }}">{{ _('Selective restore') }}</a></li>
+            </ul>
+        </div>
+        <div class="box-wrap inner">
+            <div id="general">
+                {% if restore_running %}
+                    <p>
+                        <span class="spinner"></span>&nbsp;<strong>{{ _('A restore is running!') }}</strong>
+                    </p>
+                {% endif %}
+
+                <p>{{ _('Selectively restore watches and groups from one backup .zip: upload it first, review the add/update/skip checklist, then confirm to apply.') }}</p>
+                <p>{{ _('Watches that were manually modified locally, or whose URL already exists under a different UUID, are skipped. Unselected content is never touched.') }}</p>
+                <p class="pure-form-message">
+                    {{ _('Max upload size: %(mb)s MB', mb=max_upload_mb) }}
+                </p>
+
+                <form class="pure-form pure-form-stacked settings"
+                      action="{{ url_for('backups.selective_restore.selective_analyze') }}"
+                      method="POST"
+                      enctype="multipart/form-data">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+                    <div class="pure-control-group">
+                        <label for="zip_file">{{ _('Backup .ZIP file') }}</label>
+                        <input id="zip_file" type="file" name="zip_file" accept=".zip" required>
+                    </div>
+
+                    <div class="pure-controls">
+                        <button type="submit" class="pure-button pure-button-primary">{{ _('Analyze backup') }}</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+{% endblock %}

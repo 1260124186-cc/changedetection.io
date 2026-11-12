@@ -93,9 +93,11 @@ def create_backup(datastore_path, watches: dict, tags: dict = None):
 
 def construct_blueprint(datastore: ChangeDetectionStore):
     from .restore import construct_restore_blueprint
+    from .selective import construct_selective_restore_blueprint
 
     backups_blueprint = Blueprint('backups', __name__, template_folder="templates")
     backups_blueprint.register_blueprint(construct_restore_blueprint(datastore))
+    backups_blueprint.register_blueprint(construct_selective_restore_blueprint(datastore))
     backup_threads = []
 
     @backups_blueprint.route("/request-backup", methods=['POST'])

@@ -1,0 +1,124 @@
+{% extends 'base.html' %}
+{% block content %}
+    {% macro reason_text(entry) %}
+        {% if entry.reason == 'local_modified' %}
+            {{ _('Skipped: manually modified locally') }}
+            {% if entry.details.changed_fields %}
+                <span class="pure-form-message-inline">({{ _('Changed fields: %(fields)s', fields=entry.details.changed_fields|join(', ')) }})</span>
+            {% endif %}
+            {% if entry.details.changed_config_files %}
+                <span class="pure-form-message-inline">({{ _('Changed processor config: %(files)s', files=entry.details.changed_config_files|join(', ')) }})</span>
+            {% endif %}
+        {% elif entry.reason == 'url_conflict' %}
+            {{ _('Skipped: same URL already exists under UUID %(uuid)s', uuid=entry.details.conflict_uuid) }}
+        {% elif entry.reason == 'title_conflict' %}
+            {{ _('Skipped: a group with the same title already exists (UUID %(uuid)s)', uuid=entry.details.conflict_uuid) }}
+        {% elif entry.reason == 'invalid_backup_entry' %}
+            {{ _('Skipped: backup entry is unreadable') }}
+        {% endif %}
+    {% endmacro %}
+
+    {% macro entity_table(entries, input_name, column_label) %}
+        <table class="pure-table pure-table-striped" style="width: 100%;">
+            <thead>
+                <tr>
+                    <th style="width: 3em;"></th>
+                    <th>{{ column_label }}</th>
+                    <th style="width: 22em;">UUID</th>
+                    <th>{{ _('Details') }}</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for entry in entries %}
+                    <tr>
+                        <td>
+                            {% if entry.selectable %}
+                                <input type="checkbox" name="{{ input_name }}" value="{{ entry.uuid }}" checked>
+                            {% endif %}
+                        </td>
+                        <td>
+                            {{ entry.name }}
+                            {% if entry.entity_type == 'tag' and entry.required_by_watches %}
+                                <span class="pure-form-message-inline">
+                                    {{ _('Required by %(count)s selected watch(es)', count=entry.required_by_watches|length) }}
+                                </span>
+                            {% endif %}
+                        </td>
+                        <td><code>{{ entry.uuid }}</code></td>
+                        <td>{{ reason_text(entry) }}</td>
+                    </tr>
+                {% else %}
+                    <tr><td colspan="4">{{ _('None') }}</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% endmacro %}
+
+    <div class="edit-form">
+        <div class="tabs collapsable">
+            <ul>
+                <li class="tab"><a href="{{ url_for('backups.create') }}">{{ _('Create') }}</a></li>
+                <li class="tab"><a href="{{ url_for('backups.restore.restore') }}">{{ _('Restore') }}</a></li>
+                <li class="tab active"><a href="{{ url_for('backups.selective_restore.selective_upload') }}">{{ _('Selective restore') }}</a></li>
+            </ul>
+        </div>
+        <div class="box-wrap inner">
+            <div id="general">
+                {% if restore_running %}
+                    <p><span class="spinner"></span>&nbsp;<strong>{{ _('A restore is running!') }}</strong></p>
+                {% endif %}
+
+                <p>
+                    {% if plan.backup %}
+                        {{ _('Backup: %(filename)s', filename=plan.backup.filename) }}
+                    {% endif %}
+                    —
+                    {{ _('Watches: %(add)s add / %(upd)s update / %(skip)s skip',
+                         add=plan.counts.watches.add, upd=plan.counts.watches.update, skip=plan.counts.watches.skip) }}
+                    &nbsp;|&nbsp;
+                    {{ _('Groups: %(add)s add / %(upd)s update / %(skip)s skip',
+                         add=plan.counts.tags.add, upd=plan.counts.tags.update, skip=plan.counts.tags.skip) }}
+                </p>
+
+                <form class="pure-form"
+                      action="{{ url_for('backups.selective_restore.selective_apply') }}"
+                      method="POST">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="hidden" name="token" value="{{ token }}">
+
+                    <h3>{{ _('Watches') }}</h3>
+
+                    <h4>{{ _('New (will be added)') }}</h4>
+                    {{ entity_table(plan.watches|selectattr('action', 'equalto', 'add')|list, 'watch_uuid', _('URL')) }}
+
+                    <h4>{{ _('Unchanged locally (will be updated)') }}</h4>
+                    {{ entity_table(plan.watches|selectattr('action', 'equalto', 'update')|list, 'watch_uuid', _('URL')) }}
+
+                    <h4>{{ _('Skipped') }}</h4>
+                    {{ entity_table(plan.watches|selectattr('action', 'equalto', 'skip')|list, 'watch_uuid', _('URL')) }}
+
+                    <h3>{{ _('Groups') }}</h3>
+
+                    <h4>{{ _('New (will be added)') }}</h4>
+                    {{ entity_table(plan.tags|selectattr('action', 'equalto', 'add')|list, 'tag_uuid', _('Title')) }}
+
+                    <h4>{{ _('Unchanged locally (will be updated)') }}</h4>
+                    {{ entity_table(plan.tags|selectattr('action', 'equalto', 'update')|list, 'tag_uuid', _('Title')) }}
+
+                    <h4>{{ _('Skipped') }}</h4>
+                    {{ entity_table(plan.tags|selectattr('action', 'equalto', 'skip')|list, 'tag_uuid', _('Title')) }}
+
+                    <div class="pure-controls" style="margin-top: 1em;">
+                        <button type="submit" class="pure-button pure-button-primary"
+                                {% if restore_running %}disabled{% endif %}>
+                            {{ _('Restore selected') }}
+                        </button>
+                        <a class="pure-button" href="{{ url_for('backups.selective_restore.selective_upload') }}">
+                            {{ _('Cancel') }}
+                        </a>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+{% endblock %}
