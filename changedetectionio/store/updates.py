@@ -884,3 +884,43 @@ class DatastoreUpdatesMixin:
         if any(isinstance(g, dict) and g.get('resource') == base + '/mcp/v1' for g in grants.values()):
             application['mcp_base_url'] = base
             logger.info(f"update_34: kept existing MCP sign-ins working, Public MCP address set to {base}")
+
+    def update_35(self):
+        """Heal history timelines split across per-processor indexes.
+
+        Each processor reads its own index (history.txt vs history-{processor}.txt), and processor
+        switches before this release simply changed which one was read - snapshots taken under the
+        previous processor stayed behind in a second, invisible index. Fold every stale index in a
+        watch's data directory into the index its *current* processor reads, then remove the stale
+        one. Snapshot files are never touched; the merge is timestamp-keyed, atomic and idempotent
+        (the same Watch.migrate_history_to_processor() routine the processor switch now runs), so
+        this is safe to re-run and neither duplicates a snapshot nor drops a record.
+        """
+        import glob
+
+        for uuid, watch in self.data['watching'].items():
+            data_dir = watch.data_dir
+            if not data_dir or not os.path.isdir(data_dir):
+                continue
+
+            current_processor = watch.get('processor') or 'text_json_diff'
+            current_index = watch.history_index_filename_for(current_processor)
+            stale_indexes = sorted(
+                path for path in glob.glob(os.path.join(data_dir, 'history*.txt'))
+                if os.path.basename(path) != current_index
+            )
+
+            for stale_path in stale_indexes:
+                stale_name = os.path.basename(stale_path)
+                if stale_name == 'history.txt':
+                    stale_processor = 'text_json_diff'
+                else:
+                    # history-{processor}.txt, only files matching this glob can reach here
+                    stale_processor = stale_name[len('history-'):-len('.txt')]
+
+                try:
+                    watch.migrate_history_to_processor(current_processor, from_processor=stale_processor)
+                except Exception as e:
+                    # One watch/index failing must not block the rest of the startup migration;
+                    # the stale index stays in place and the next startup retries automatically.
+                    logger.error(f"update_35: could not merge {stale_name} for watch {uuid}: {e}")

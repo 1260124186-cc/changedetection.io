@@ -217,6 +217,19 @@ def update_watch(datastore, uuid, data):
     if unknown_fields:
         raise ApiError(f"Unknown field(s): {', '.join(sorted(unknown_fields))}")
 
+    # Switching processing mode must carry the existing snapshots/unread state onto the new
+    # processor's timeline first. Done before any field is written, so a migration failure
+    # leaves the watch on its old processor with its full history and the whole PUT errors out.
+    new_processor = json_data.get('processor')
+    if new_processor and new_processor != (watch.get('processor') or 'text_json_diff'):
+        try:
+            datastore.migrate_watch_history(watch.get('uuid'), new_processor)
+        except ApiError:
+            raise
+        except Exception as e:
+            logger.exception(f"History migration while switching processor failed: {e}")
+            raise ApiError("Could not switch processing mode: history migration failed, the previous history was kept. See the server log for details.", 500)
+
     watch.update(json_data)
     # The request alone can be valid but leave no interval once merged, e.g. nulling the
     # interval of a watch that already has time_between_check_use_default=False

@@ -699,6 +699,30 @@ class ChangeDetectionStore(DatastoreUpdatesMixin, FileSavingDataStore):
         self.__data['watching'][uuid].clear_watch()
         self.__data['watching'][uuid].commit()
 
+    def migrate_watch_history(self, uuid, new_processor, old_processor=None):
+        """Move a watch's snapshot timeline onto new_processor's history index.
+
+        Used when the processing mode changes, so snapshots (and the unread state keyed off
+        their timestamps) stay in one continuous history instead of being stranded in the old
+        processor's index. Idempotent and crash-safe - see Watch.migrate_history_to_processor().
+
+        Call this BEFORE writing new_processor into the watch; the current processor is then
+        used as the source automatically. Pass old_processor explicitly only when the field was
+        already changed. Returns the number of entries added, 0 when there is nothing to do.
+        """
+        watch = self.__data['watching'].get(uuid)
+        if not watch:
+            return 0
+
+        if old_processor is None:
+            old_processor = watch.get('processor') or 'text_json_diff'
+        new_processor = new_processor or 'text_json_diff'
+        if old_processor == new_processor:
+            return 0
+
+        with self.lock:
+            return watch.migrate_history_to_processor(new_processor, from_processor=old_processor)
+
     @property
     def watch_limit(self):
         """Total watches allowed by PAGE_WATCH_LIMIT, or None when there is no limit.

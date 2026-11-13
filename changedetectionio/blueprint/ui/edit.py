@@ -105,10 +105,20 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
         if switch_processor:
             for p in processors.available_processors():
                 if p[0] == switch_processor:
+                    # Carry the existing snapshots and unread state onto the new processor's
+                    # timeline BEFORE flipping the field. Migration is atomic: on failure the
+                    # watch keeps its old processor with the full history, ready to retry.
+                    try:
+                        datastore.migrate_watch_history(uuid, switch_processor)
+                    except Exception as e:
+                        logger.exception(f"History migration while switching processor failed: {e}")
+                        flash(gettext("Could not switch mode - history migration failed, the previous history was kept. See the log for details."), 'error')
+                        return redirect(url_for('ui.ui_edit.edit_page', uuid=uuid))
+
                     datastore.data['watching'][uuid]['processor'] = switch_processor
+                    datastore.data['watching'][uuid].commit()
                     flash(gettext("Switched to mode - {}.").format(p[1]))
-                    datastore.clear_watch_history(uuid)
-                    redirect(url_for('ui_edit.edit_page', uuid=uuid))
+                    return redirect(url_for('ui.ui_edit.edit_page', uuid=uuid))
 
         # be sure we update with a copy instead of accidently editing the live object by reference
         default = None
@@ -227,6 +237,18 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
 
 
         if request.method == 'POST' and form.validate():
+
+            # If the processing mode changes, carry the existing snapshots and unread state
+            # onto the new processor's timeline before any field is written. A failed migration
+            # leaves the watch (and its history) untouched, so the save can be retried safely.
+            posted_processor = form.data.get('processor')
+            if posted_processor and posted_processor != datastore.data['watching'][uuid].get('processor'):
+                try:
+                    datastore.migrate_watch_history(uuid, posted_processor)
+                except Exception as e:
+                    logger.exception(f"History migration while switching processor failed: {e}")
+                    flash(gettext("Could not switch mode - history migration failed, the previous history was kept. See the log for details."), 'error')
+                    return redirect(url_for('ui.ui_edit.edit_page', uuid=uuid))
 
             extra_update_obj = {
                 'consecutive_filter_failures': 0,

@@ -419,14 +419,16 @@ class model(EntityPersistenceMixin, watch_base):
         domain = parsed.hostname
         return domain
 
+    @staticmethod
+    def history_index_filename_for(processor):
+        # So that you dont try to view different histories in different 'diff' setups, can confuse cdio.
+        if not processor or processor == 'text_json_diff':
+            return 'history.txt'
+        return f'history-{processor}.txt'
+
     @property
     def history_index_filename(self):
-        # So that you dont try to view different histories in different 'diff' setups, can confuse cdio.
-        processor = self.get('processor')
-        if not processor or self.get('processor') == 'text_json_diff':
-            return 'history.txt'
-        else:
-            return f'history-{processor}.txt'
+        return self.history_index_filename_for(self.get('processor'))
 
     def clear_watch(self):
         import pathlib
@@ -570,6 +572,54 @@ class model(EntityPersistenceMixin, watch_base):
     def history_n(self):
         return self.__history_n
 
+    def _read_history_index(self, fname):
+        """Parse one history index file into an ordered {timestamp: snapshot path} dict.
+
+        An index is just lines of ``{epoch-time},{snapshot-filename}\\n`` (see history.txt /
+        history-{processor}.txt). Shared by the history property and the processor-switch
+        timeline migration, so both apply exactly the same safety rules.
+
+        Entries restored from backup or written by older versions can contain absolute or
+        traversal paths, never trust them: basename() reduces every value to a plain name, so
+        the only remaining way out of data_dir is a symlink. One directory listing replaces the
+        per-line realpath() + exists() calls (~10 syscalls per snapshot); only symlinks still
+        pay for a realpath() containment check. A missing snapshot drops just that entry; a
+        dangling or unsafe symlink is skipped. Returns an empty dict when the file is absent.
+        """
+        tmp_history = {}
+
+        if not self.data_dir or not os.path.isfile(fname):
+            return tmp_history
+
+        # Note: scandir() never lists '.' or '..', so those are rejected as "not found".
+        safe_data_dir = os.path.realpath(self.data_dir)
+        with os.scandir(safe_data_dir) as it:
+            dir_entries = {e.name: e for e in it}
+
+        with open(fname, "r", encoding='utf-8') as f:
+            for i in f.readlines():
+                if ',' in i:
+                    k, v = i.strip().split(',', 2)
+
+                    snapshot_fname = os.path.basename(v.strip())
+                    entry = dir_entries.get(snapshot_fname)
+                    if entry is None:
+                        continue
+
+                    resolved_path = os.path.join(safe_data_dir, snapshot_fname)
+                    if entry.is_symlink():
+                        resolved_path = os.path.realpath(resolved_path)
+                        if not resolved_path.startswith(safe_data_dir + os.sep):
+                            logger.warning(f"Skipping unsafe history entry for {self.get('uuid')}: {v!r}")
+                            continue
+                        # Dangling symlink, same as the file not existing
+                        if not os.path.exists(resolved_path):
+                            continue
+
+                    tmp_history[k] = resolved_path
+
+        return tmp_history
+
     @property
     def history(self):
         """History index is just a text file as a list
@@ -582,8 +632,6 @@ class model(EntityPersistenceMixin, watch_base):
             We read in this list as the history information
 
         """
-        tmp_history = {}
-
         # In the case we are only using the watch for processing without history
         if not self.data_dir:
             return []
@@ -592,37 +640,9 @@ class model(EntityPersistenceMixin, watch_base):
         fname = os.path.join(self.data_dir, self.history_index_filename)
         if os.path.isfile(fname):
             logger.debug(f"Reading watch history index for {self.get('uuid')}")
-
-            # Entries restored from backup could contain absolute or traversal paths, never trust them.
-            # basename() reduces every entry to a plain name, so the only remaining way out of data_dir
-            # is a symlink. One directory listing replaces the per-line realpath() + exists() calls
-            # (~10 syscalls per snapshot); only symlinks still pay for a realpath() containment check.
-            # Note: scandir() never lists '.' or '..', so those are rejected as "not found".
-            safe_data_dir = os.path.realpath(self.data_dir)
-            with os.scandir(safe_data_dir) as it:
-                dir_entries = {e.name: e for e in it}
-
-            with open(fname, "r", encoding='utf-8') as f:
-                for i in f.readlines():
-                    if ',' in i:
-                        k, v = i.strip().split(',', 2)
-
-                        snapshot_fname = os.path.basename(v.strip())
-                        entry = dir_entries.get(snapshot_fname)
-                        if entry is None:
-                            continue
-
-                        resolved_path = os.path.join(safe_data_dir, snapshot_fname)
-                        if entry.is_symlink():
-                            resolved_path = os.path.realpath(resolved_path)
-                            if not resolved_path.startswith(safe_data_dir + os.sep):
-                                logger.warning(f"Skipping unsafe history entry for {self.get('uuid')}: {v!r}")
-                                continue
-                            # Dangling symlink, same as the file not existing
-                            if not os.path.exists(resolved_path):
-                                continue
-
-                        tmp_history[k] = resolved_path
+            tmp_history = self._read_history_index(fname)
+        else:
+            tmp_history = {}
 
         if len(tmp_history):
             self.__newest_history_key = list(tmp_history.keys())[-1]
@@ -790,6 +810,97 @@ class model(EntityPersistenceMixin, watch_base):
         # reimport
         bump = self.history
         gc_debounce.collect('watch.history_bump')
+
+    def migrate_history_to_processor(self, to_processor, from_processor=None):
+        """Carry this watch's whole history timeline onto another processor's history index.
+
+        Every processor reads its own index (history.txt for text_json_diff,
+        history-{processor}.txt otherwise), so merely flipping watch['processor'] hides every
+        snapshot taken before the switch and the history looks split in two. This merges the
+        old index into the new one so the watch keeps one continuous, time-ordered timeline
+        across processing-mode switches.
+
+        Snapshot files are never moved, copied or deleted: both indexes live in the same data
+        directory and reference the snapshots by basename. Only index entries are merged, which
+        also carries the unread state over unchanged - last_viewed is a watch field compared
+        against the same snapshot timestamps.
+
+        Idempotent and crash-safe:
+        - entries are keyed by timestamp, so running this again never duplicates a line
+        - the target index is written to a temp file and atomically os.replace()d into place
+        - the source index is removed only after the rewritten target has been verified on
+          disk, so a failure midway leaves the old timeline fully readable and a retry picks
+          up cleanly without losing or duplicating anything
+
+        :param to_processor: processor name the watch is switching to (e.g. 'restock_diff')
+        :param from_processor: processor whose index currently holds the timeline; defaults to
+               the watch's current processor. Pass it explicitly when the field was already
+               changed by the caller.
+        :return: number of entries newly added to the target index (0 when nothing to merge)
+        """
+        if from_processor is None:
+            from_processor = self.get('processor')
+
+        source_name = self.history_index_filename_for(from_processor)
+        target_name = self.history_index_filename_for(to_processor)
+
+        if source_name == target_name or not self.data_dir:
+            return 0
+
+        source_path = os.path.join(self.data_dir, source_name)
+        if not os.path.isfile(source_path):
+            # Nothing to carry: fresh watch, already migrated, or history was explicitly cleared
+            return 0
+
+        target_path = os.path.join(self.data_dir, target_name)
+        source_entries = self._read_history_index(source_path)
+        target_entries = self._read_history_index(target_path) if os.path.isfile(target_path) else {}
+
+        # On the unlikely same-timestamp collision, target entries win: they belong to the
+        # processor the watch is switching to. The source snapshot file stays on disk either
+        # way, so no content is ever deleted.
+        merged = dict(target_entries)
+        added = 0
+        for key, filepath in source_entries.items():
+            if key not in merged:
+                merged[key] = filepath
+                added += 1
+
+        if merged:
+            # Keep the original chronological order no matter which index an entry came from
+            # (timestamp keys are epoch seconds, see worker.py -> save_history_blob())
+            ordered = sorted(merged.items(), key=lambda item: int(item[0]))
+            output = ''.join(f"{key},{Path(filepath).name}\n" for key, filepath in ordered)
+            # Atomic: a crash either leaves the previous target in place or the full new one
+            self._write_atomic(dest=target_path, data=output, mode='w')
+
+            # Verify before dropping the source, otherwise a failed/truncated write would
+            # orphan the old timeline. Re-read through the same safety parser as normal reads.
+            verified = self._read_history_index(target_path)
+            if any(key not in verified for key in merged):
+                raise RuntimeError(
+                    f"History migration for watch {self.get('uuid')} failed verification: "
+                    f"{target_name} is missing entries, keeping {source_name} in place"
+                )
+
+        # Target is complete (or there was nothing valid to write); retire the source index.
+        # The snapshot files themselves are intentionally left untouched.
+        os.unlink(source_path)
+        logger.info(
+            f"Watch {self.get('uuid')}: migrated {len(source_entries)} history entries "
+            f"({added} new) from {source_name} into {target_name}"
+        )
+
+        # Refresh the cached counters. When the processor field was already flipped, the
+        # normal history reader points at the target index; otherwise seed the cache directly.
+        if self.history_index_filename == target_name:
+            _ = self.history
+        else:
+            self.__newest_history_key = list(merged.keys())[-1] if merged else None
+            self.__history_n = len(merged)
+        gc_debounce.collect('watch.history_bump')
+
+        return added
 
     # Save some text file to the appropriate path and bump the history
     # result_obj from fetch_site_status.run()
